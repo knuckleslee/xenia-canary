@@ -321,6 +321,11 @@ class D3D12CommandProcessor final : public CommandProcessor {
   bool IssueCopy() override;
   XE_NOINLINE
   bool IssueCopy_ReadbackResolvePath();
+  // Resolves all rectangles of the copy draw, see Resolve.
+  bool ResolveCopyDraw(uint32_t& written_address_out,
+                       uint32_t& written_length_out,
+                       reg::RB_COPY_DEST_INFO* copy_dest_info_out = nullptr,
+                       bool* written_scaled_out = nullptr);
   void InitializeTrace() override;
 
  private:

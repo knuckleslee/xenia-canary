@@ -9,12 +9,19 @@
 
 #include "xenia/gpu/draw_util.h"
 
+#include <algorithm>
+#include <cfloat>
+#include <cmath>
+#include <cstring>
+#include <tuple>
+
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/memory.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/registers.h"
+#include "xenia/gpu/shader_interpreter.h"
 #include "xenia/gpu/texture_address.h"
 #include "xenia/gpu/texture_cache.h"
 #include "xenia/ui/graphics_util.h"
@@ -1175,7 +1182,7 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
                     uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
                     bool fixed_rgba16_truncated_to_minus_1_to_1,
-                    ResolveInfo& info_out) {
+                    ResolveInfo& info_out, const ResolveRectangle* rectangle) {
   // Don't pass uninitialized values to shaders, not to leak data to frame
   // captures. Also initialize an invalid resolve to empty.
   info_out.coordinate_info.packed = 0;
@@ -1199,40 +1206,51 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
 
   // Get the extent of pixels covered by the resolve rectangle, according to the
   // top-left rasterization rule.
-  // D3D9 HACK: Vertices to use are always in vf0, and are written by the CPU.
-  xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
-  if (fetch.type != xenos::FetchConstantType::kVertex || fetch.size != 3 * 2) {
-    XELOGE("Unsupported resolve vertex buffer format");
-    assert_always();
-    return false;
+  ResolveRectangle vf0_rectangle;
+  if (!rectangle) {
+    // D3D9 HACK: Vertices to use are always in vf0, and are written by the
+    // CPU.
+    xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
+    if (fetch.type != xenos::FetchConstantType::kVertex ||
+        fetch.size != kResolveVf0SizeDwords) {
+      XELOGE("Unsupported resolve vertex buffer format");
+      assert_always();
+      return false;
+    }
+    trace_writer.WriteMemoryRead(fetch.address * sizeof(uint32_t),
+                                 fetch.size * sizeof(uint32_t));
+    const float* vertices_guest = reinterpret_cast<const float*>(
+        memory.TranslatePhysical(fetch.address * sizeof(uint32_t)));
+    float vertices_swapped[kResolveVf0SizeDwords];
+    for (size_t i = 0; i < xe::countof(vertices_swapped); ++i) {
+      vertices_swapped[i] = xenos::GpuSwap(vertices_guest[i], fetch.endian);
+    }
+    vf0_rectangle.left =
+        std::min(std::min(vertices_swapped[0], vertices_swapped[2]),
+                 vertices_swapped[4]);
+    vf0_rectangle.top =
+        std::min(std::min(vertices_swapped[1], vertices_swapped[3]),
+                 vertices_swapped[5]);
+    vf0_rectangle.right =
+        std::max(std::max(vertices_swapped[0], vertices_swapped[2]),
+                 vertices_swapped[4]);
+    vf0_rectangle.bottom =
+        std::max(std::max(vertices_swapped[1], vertices_swapped[3]),
+                 vertices_swapped[5]);
+    rectangle = &vf0_rectangle;
   }
-  trace_writer.WriteMemoryRead(fetch.address * sizeof(uint32_t),
-                               fetch.size * sizeof(uint32_t));
-  const float* vertices_guest = reinterpret_cast<const float*>(
-      memory.TranslatePhysical(fetch.address * sizeof(uint32_t)));
   // Most vertices have a negative half-pixel offset applied, which we reverse.
   float half_pixel_offset =
       regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero
           ? 0.5f
           : 0.0f;
-  int32_t vertices_fixed[6];
-  float vertices_swapped[6];
-  for (size_t i = 0; i < xe::countof(vertices_fixed); ++i) {
-    vertices_swapped[i] = xenos::GpuSwap(vertices_guest[i], fetch.endian);
-    vertices_fixed[i] =
-        ui::FloatToD3D11Fixed16p8(vertices_swapped[i] + half_pixel_offset);
-  }
 
   // Inclusive.
-  int32_t x0 = std::min(std::min(vertices_fixed[0], vertices_fixed[2]),
-                        vertices_fixed[4]);
-  int32_t y0 = std::min(std::min(vertices_fixed[1], vertices_fixed[3]),
-                        vertices_fixed[5]);
+  int32_t x0 = ui::FloatToD3D11Fixed16p8(rectangle->left + half_pixel_offset);
+  int32_t y0 = ui::FloatToD3D11Fixed16p8(rectangle->top + half_pixel_offset);
   // Exclusive.
-  int32_t x1 = std::max(std::max(vertices_fixed[0], vertices_fixed[2]),
-                        vertices_fixed[4]);
-  int32_t y1 = std::max(std::max(vertices_fixed[1], vertices_fixed[3]),
-                        vertices_fixed[5]);
+  int32_t x1 = ui::FloatToD3D11Fixed16p8(rectangle->right + half_pixel_offset);
+  int32_t y1 = ui::FloatToD3D11Fixed16p8(rectangle->bottom + half_pixel_offset);
   // Top-left - include .5 (0.128 treated as 0 covered, 0.129 as 0 not covered).
   x0 = (x0 + 127) >> 8;
   y0 = (y0 + 127) >> 8;
@@ -1765,6 +1783,288 @@ uint32_t GetResolveDownscalePixelSizeLog2(
   const FormatInfo& dest_format_info = *FormatInfo::Get(
       xenos::TextureFormat(uint32_t(copy_dest_info.copy_dest_format)));
   return xe::log2_floor(dest_format_info.bits_per_pixel >> 3);
+}
+
+bool IsResolveUsingVertexShader(const RegisterFile& regs) {
+  xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
+  // The vf0 path is kept for a single rectangle.
+  return fetch.type != xenos::FetchConstantType::kVertex ||
+         fetch.size != kResolveVf0SizeDwords ||
+         regs.Get<reg::VGT_DRAW_INITIATOR>().num_indices >
+             kResolveVf0VertexCount;
+}
+
+namespace {
+
+// Component masks of the exports used for getting the rectangles.
+constexpr uint32_t kExportKillVertexComponentMask = 0b0100;
+constexpr uint32_t kExportPositionXYMask = 0b0011;
+constexpr uint32_t kExportPositionWMask = 0b1000;
+// The sign bit is ignored (see ucode::ExportRegister::
+// kVSPointSizeEdgeFlagKillVertex).
+constexpr uint32_t kVertexKillValueMask = ~(UINT32_C(1) << 31);
+// Width of the vertex index fields in VGT_INDX_OFFSET and the index range.
+constexpr uint32_t kVertexIndexBits = 24;
+constexpr uint32_t kVertexIndexMask = (UINT32_C(1) << kVertexIndexBits) - 1;
+// A rectangle list rectangle is described by three vertices.
+constexpr uint32_t kRectangleListVerticesPerRectangle = 3;
+// Above this, the resolve is dropped rather than running the vertex shader for
+// all rectangles.
+constexpr uint32_t kMaxResolveRectanglesFromVertexShader = 8192;
+
+class ResolvePositionExportSink : public ShaderInterpreter::ExportSink {
+ public:
+  void Export(ucode::ExportRegister export_register, const float* value,
+              uint32_t value_mask) override {
+    if (export_register == ucode::ExportRegister::kVSPosition) {
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (value_mask & (uint32_t(1) << i)) {
+          position_[i] = value[i];
+          position_mask_ |= uint32_t(1) << i;
+        }
+      }
+    } else if (export_register ==
+                   ucode::ExportRegister::kVSPointSizeEdgeFlagKillVertex &&
+               (value_mask & kExportKillVertexComponentMask)) {
+      vertex_kill_ = xe::memory::Reinterpret<uint32_t>(value[2]);
+    }
+  }
+
+  void Reset() {
+    position_mask_ = 0;
+    vertex_kill_ = 0;
+  }
+
+  const float* position() const { return position_; }
+  uint32_t position_mask() const { return position_mask_; }
+  bool is_vertex_killed() const {
+    return (vertex_kill_ & kVertexKillValueMask) != 0;
+  }
+
+ private:
+  float position_[4] = {};
+  uint32_t position_mask_ = 0;
+  uint32_t vertex_kill_ = 0;
+};
+
+// Merges rectangles that share a whole edge, first into horizontal spans, then
+// into vertical ones.
+void MergeResolveRectangles(std::vector<ResolveRectangle>& rectangles) {
+  auto merge = [&rectangles](bool horizontal) {
+    std::sort(
+        rectangles.begin(), rectangles.end(),
+        [horizontal](const ResolveRectangle& a, const ResolveRectangle& b) {
+          if (horizontal) {
+            return std::tie(a.top, a.bottom, a.left) <
+                   std::tie(b.top, b.bottom, b.left);
+          }
+          return std::tie(a.left, a.right, a.top) <
+                 std::tie(b.left, b.right, b.top);
+        });
+    size_t merged_count = 0;
+    for (size_t i = 0; i < rectangles.size(); ++i) {
+      const ResolveRectangle& rectangle = rectangles[i];
+      if (merged_count) {
+        ResolveRectangle& last = rectangles[merged_count - 1];
+        if (horizontal) {
+          if (last.top == rectangle.top && last.bottom == rectangle.bottom &&
+              last.right == rectangle.left) {
+            last.right = rectangle.right;
+            continue;
+          }
+        } else {
+          if (last.left == rectangle.left && last.right == rectangle.right &&
+              last.bottom == rectangle.top) {
+            last.bottom = rectangle.bottom;
+            continue;
+          }
+        }
+      }
+      rectangles[merged_count++] = rectangle;
+    }
+    rectangles.resize(merged_count);
+  };
+  merge(true);
+  merge(false);
+}
+
+}  // namespace
+
+bool GetResolveRectanglesFromVertexShader(
+    const RegisterFile& regs, const Memory& memory, TraceWriter& trace_writer,
+    const Shader& vertex_shader,
+    std::vector<ResolveRectangle>& rectangles_out) {
+  rectangles_out.clear();
+  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  if (vgt_draw_initiator.prim_type != xenos::PrimitiveType::kRectangleList ||
+      vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex) {
+    XELOGE(
+        "Unsupported resolve primitive type {} or index source {} without "
+        "vertices in vf0",
+        uint32_t(vgt_draw_initiator.prim_type),
+        uint32_t(vgt_draw_initiator.source_select));
+    return false;
+  }
+  assert_true(vertex_shader.is_ucode_analyzed());
+  if (!ShaderInterpreter::CanInterpretShader(vertex_shader, true)) {
+    XELOGE("Resolve vertex shader can't be interpreted, dropping the resolve");
+    return false;
+  }
+  uint32_t rectangle_count =
+      vgt_draw_initiator.num_indices / kRectangleListVerticesPerRectangle;
+  if (rectangle_count > kMaxResolveRectanglesFromVertexShader) {
+    XELOGE(
+        "Resolve without vertices in vf0 has {} rectangles (more than {}), "
+        "dropping the resolve",
+        rectangle_count, kMaxResolveRectanglesFromVertexShader);
+    return false;
+  }
+
+  uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
+  uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
+  uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+
+  auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
+  float viewport_scale[] = {
+      pa_cl_vte_cntl.vport_x_scale_ena
+          ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)
+          : 1.0f,
+      pa_cl_vte_cntl.vport_y_scale_ena
+          ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE)
+          : 1.0f,
+  };
+  float viewport_offset[] = {
+      pa_cl_vte_cntl.vport_x_offset_ena
+          ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET)
+          : 0.0f,
+      pa_cl_vte_cntl.vport_y_offset_ena
+          ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET)
+          : 0.0f,
+  };
+
+  ShaderInterpreter shader_interpreter(regs, memory);
+  shader_interpreter.SetTraceWriter(&trace_writer);
+  shader_interpreter.SetShader(vertex_shader, true);
+  ResolvePositionExportSink export_sink;
+  shader_interpreter.SetExportSink(&export_sink);
+
+  rectangles_out.reserve(rectangle_count);
+  for (uint32_t i = 0; i < rectangle_count; ++i) {
+    // The rectangle is the bounding box of its vertices.
+    ResolveRectangle rectangle = {FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX};
+    bool rectangle_valid = true;
+    for (uint32_t j = 0; j < kRectangleListVerticesPerRectangle; ++j) {
+      uint32_t vertex_index = std::min(
+          max_index,
+          std::max(min_index,
+                   (i * kRectangleListVerticesPerRectangle + j + index_offset) &
+                       kVertexIndexMask));
+      export_sink.Reset();
+      // The vertex shader may expect registers without input to be zero.
+      std::memset(shader_interpreter.temp_registers(), 0,
+                  sizeof(float) * 4 * xenos::kMaxShaderTempRegisters);
+      shader_interpreter.temp_registers()[0] = float(vertex_index);
+      shader_interpreter.Execute();
+      if (shader_interpreter.was_texture_fetch_unsupported()) {
+        XELOGE(
+            "Resolve vertex shader uses unsupported texture fetches, dropping "
+            "the resolve");
+        rectangles_out.clear();
+        return false;
+      }
+      if (export_sink.is_vertex_killed() ||
+          (export_sink.position_mask() & kExportPositionXYMask) !=
+              kExportPositionXYMask ||
+          (!pa_cl_vte_cntl.vtx_xy_fmt &&
+           !(export_sink.position_mask() & kExportPositionWMask))) {
+        rectangle_valid = false;
+        break;
+      }
+      float position[2];
+      for (uint32_t k = 0; k < 2; ++k) {
+        position[k] = export_sink.position()[k];
+        if (!pa_cl_vte_cntl.vtx_xy_fmt) {
+          position[k] /= export_sink.position()[3];
+        }
+        position[k] = position[k] * viewport_scale[k] + viewport_offset[k];
+      }
+      if (!std::isfinite(position[0]) || !std::isfinite(position[1])) {
+        // A triangle with a non-finite vertex position is not drawn.
+        rectangle_valid = false;
+        break;
+      }
+      rectangle.left = std::min(rectangle.left, position[0]);
+      rectangle.top = std::min(rectangle.top, position[1]);
+      rectangle.right = std::max(rectangle.right, position[0]);
+      rectangle.bottom = std::max(rectangle.bottom, position[1]);
+    }
+    // Rectangles entirely left of or above the render target are not visible.
+    if (rectangle_valid && rectangle.left < rectangle.right &&
+        rectangle.top < rectangle.bottom && rectangle.right > 0.0f &&
+        rectangle.bottom > 0.0f) {
+      rectangles_out.push_back(rectangle);
+    }
+  }
+  shader_interpreter.SetExportSink(nullptr);
+
+  MergeResolveRectangles(rectangles_out);
+  return true;
+}
+
+bool ResolveCopyDraw(const RegisterFile& regs, const Memory& memory,
+                     TraceWriter& trace_writer, bool use_vertex_shader,
+                     const Shader* vertex_shader,
+                     const ResolveRectangleFunction& resolve_rectangle,
+                     uint32_t& written_address_out,
+                     uint32_t& written_length_out, bool* written_scaled_out) {
+  if (!use_vertex_shader) {
+    return resolve_rectangle(nullptr, written_address_out, written_length_out,
+                             written_scaled_out);
+  }
+
+  written_address_out = 0;
+  written_length_out = 0;
+  if (written_scaled_out) {
+    *written_scaled_out = false;
+  }
+  if (!vertex_shader) {
+    XELOGE("Resolve without vertices in vf0 has no vertex shader");
+    return false;
+  }
+  std::vector<ResolveRectangle> rectangles;
+  if (!GetResolveRectanglesFromVertexShader(regs, memory, trace_writer,
+                                            *vertex_shader, rectangles)) {
+    return false;
+  }
+  uint32_t written_end = 0;
+  for (const ResolveRectangle& rectangle : rectangles) {
+    uint32_t rectangle_written_address, rectangle_written_length;
+    bool rectangle_written_scaled = false;
+    if (!resolve_rectangle(&rectangle, rectangle_written_address,
+                           rectangle_written_length,
+                           &rectangle_written_scaled)) {
+      return false;
+    }
+    if (!rectangle_written_length) {
+      continue;
+    }
+    uint32_t rectangle_written_end =
+        rectangle_written_address + rectangle_written_length;
+    if (written_length_out) {
+      written_address_out =
+          std::min(written_address_out, rectangle_written_address);
+      written_end = std::max(written_end, rectangle_written_end);
+    } else {
+      written_address_out = rectangle_written_address;
+      written_end = rectangle_written_end;
+    }
+    written_length_out = written_end - written_address_out;
+    // TODO(knuckleslee): Rectangles may differ in being copied at 1x.
+    if (written_scaled_out && rectangle_written_scaled) {
+      *written_scaled_out = true;
+    }
+  }
+  return true;
 }
 
 }  // namespace draw_util
