@@ -287,6 +287,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
                  IndexBufferInfo* index_buffer_info,
                  bool major_mode_explicit) override;
   bool IssueCopy() override;
+  // Resolves all rectangles of the copy draw, see Resolve.
+  bool ResolveCopyDraw(uint32_t& written_address_out,
+                       uint32_t& written_length_out,
+                       reg::RB_COPY_DEST_INFO* copy_dest_info_out = nullptr,
+                       bool* written_scaled_out = nullptr);
 
   void InitializeTrace() override;
 

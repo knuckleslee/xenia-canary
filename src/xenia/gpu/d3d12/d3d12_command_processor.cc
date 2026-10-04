@@ -3296,21 +3296,41 @@ bool D3D12CommandProcessor::IssueCopy() {
   ReadbackResolveMode readback_mode = GetReadbackResolveMode();
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_,
-                                         *texture_cache_, written_address,
-                                         written_length);
+    return ResolveCopyDraw(written_address, written_length);
   } else {
     return IssueCopy_ReadbackResolvePath();
   }
 }
+
+bool D3D12CommandProcessor::ResolveCopyDraw(
+    uint32_t& written_address_out, uint32_t& written_length_out,
+    reg::RB_COPY_DEST_INFO* copy_dest_info_out, bool* written_scaled_out) {
+  const RegisterFile& regs = *register_file_;
+  auto vertex_shader = static_cast<D3D12Shader*>(active_vertex_shader());
+  bool use_vertex_shader = draw_util::IsResolveUsingVertexShader(regs);
+  if (vertex_shader && use_vertex_shader) {
+    pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  }
+  return draw_util::ResolveCopyDraw(
+      regs, *memory_, trace_writer_, use_vertex_shader, vertex_shader,
+      [&](const draw_util::ResolveRectangle* rectangle,
+          uint32_t& rectangle_written_address,
+          uint32_t& rectangle_written_length, bool* rectangle_written_scaled) {
+        return render_target_cache_->Resolve(
+            *memory_, *shared_memory_, *texture_cache_,
+            rectangle_written_address, rectangle_written_length,
+            copy_dest_info_out, rectangle_written_scaled, rectangle);
+      },
+      written_address_out, written_length_out, written_scaled_out);
+}
+
 XE_NOINLINE
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t written_address, written_length;
   reg::RB_COPY_DEST_INFO copy_dest_info;
   bool is_scaled;
-  if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                     written_address, written_length,
-                                     &copy_dest_info, &is_scaled)) {
+  if (!ResolveCopyDraw(written_address, written_length, &copy_dest_info,
+                       &is_scaled)) {
     return false;
   }
   if (!written_length) {

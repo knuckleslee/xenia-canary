@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -818,17 +819,61 @@ struct ResolveInfo {
   }
 };
 
+// The Direct3D 9 resolve vertices in vf0 are a triangle of 2-component
+// vertices.
+constexpr uint32_t kResolveVf0VertexCount = 3;
+constexpr uint32_t kResolveVf0VertexComponentCount = 2;
+constexpr uint32_t kResolveVf0SizeDwords =
+    kResolveVf0VertexCount * kResolveVf0VertexComponentCount;
+
+// Screen space, before the half-pixel offset and the window offset.
+struct ResolveRectangle {
+  float left;
+  float top;
+  float right;
+  float bottom;
+};
+
 // Returns false if there was an error obtaining the info making it totally
 // invalid. fixed_rg[ba]16_truncated_to_minus_1_to_1 is false if 16_16[_16_16]
 // color render target formats are properly emulated as -32...32, true if
 // emulated as snorm, with range limited to -1...1, but with correct blending
 // within that range.
+// If rectangle is null, it is taken from the vertices in vf0.
 bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
                     TraceWriter& trace_writer, uint32_t draw_resolution_scale_x,
                     uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
                     bool fixed_rgba16_truncated_to_minus_1_to_1,
-                    ResolveInfo& info_out);
+                    ResolveInfo& info_out,
+                    const ResolveRectangle* rectangle = nullptr);
+
+// Gets the merged rectangles of a copy draw without the Direct3D 9 vertices in
+// vf0 by running its vertex shader on the CPU. Returns false if they can't be
+// obtained.
+bool GetResolveRectanglesFromVertexShader(
+    const RegisterFile& regs, const Memory& memory, TraceWriter& trace_writer,
+    const Shader& vertex_shader, std::vector<ResolveRectangle>& rectangles_out);
+
+// Whether the copy draw needs GetResolveRectanglesFromVertexShader.
+bool IsResolveUsingVertexShader(const RegisterFile& regs);
+
+// Resolves one rectangle (or the one in vf0 if null), returning the written
+// range like the render target cache Resolve.
+using ResolveRectangleFunction = std::function<bool(
+    const ResolveRectangle* rectangle, uint32_t& written_address_out,
+    uint32_t& written_length_out, bool* written_scaled_out)>;
+
+// Resolves a copy draw, calling resolve_rectangle for each rectangle drawn if
+// use_vertex_shader (see IsResolveUsingVertexShader) is true, and returns the
+// union of the written ranges. The vertex shader must have its ucode analyzed
+// in that case.
+bool ResolveCopyDraw(const RegisterFile& regs, const Memory& memory,
+                     TraceWriter& trace_writer, bool use_vertex_shader,
+                     const Shader* vertex_shader,
+                     const ResolveRectangleFunction& resolve_rectangle,
+                     uint32_t& written_address_out,
+                     uint32_t& written_length_out, bool* written_scaled_out);
 
 // Returns log2 of the resolve copy destination texel size in bytes for the
 // destination info previously returned by a render target cache Resolve (with
